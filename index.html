@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Draw & Filter Restaurants — OSM Only</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
+  <style>
+    :root{--bg:#0b0e14;--fg:#e7eaf0;--muted:#a9b1c0;--card:#111827;--brand:#7c8cff}
+    *{box-sizing:border-box}
+    body{margin:0; font-family:system-ui, -apple-system, Segoe UI, Roboto; background:var(--bg); color:var(--fg)}
+    .app{display:grid; grid-template-columns:340px 1fr; height:100vh}
+    .side{background:var(--card); border-right:1px solid rgba(255,255,255,.08); padding:16px; overflow:auto}
+    h1{font-size:18px; margin:0 0 8px}
+    .sub{color:var(--muted); font-size:12px; margin-bottom:12px}
+    label{font-size:12px; color:var(--muted); display:block; margin:10px 0 6px}
+    input, select, button{width:100%; padding:10px 12px; border-radius:10px; border:1px solid rgba(255,255,255,.12); background:#0f1422; color:var(--fg); font:inherit}
+    button{cursor:pointer; background:linear-gradient(135deg, var(--brand), #5c6fff); color:#0b0e14; font-weight:700; border:0}
+    .btn-row{display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px}
+    #status{margin:10px 0; font-size:12px; color:var(--muted)}
+    #results{margin-top:12px}
+    .item{padding:10px; border:1px solid rgba(255,255,255,.08); border-radius:12px; margin-bottom:8px; background:#0f1422}
+    .item h3{margin:0 0 4px; font-size:14px}
+    .item .meta{font-size:12px; color:var(--muted)}
+    #map{height:100%;}
+    .help{font-size:12px; color:var(--muted); margin-top:8px}
+    .pill{display:inline-block; padding:2px 8px; border-radius:999px; background:rgba(124,140,255,.12); color:var(--brand); font-size:11px; font-weight:700}
+    @media (max-width: 900px){.app{grid-template-columns:1fr; grid-template-rows:360px 1fr} .side{height:360px}}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="side">
+      <h1>Restaurant Finder <span class="pill">OSM</span></h1>
+      <p class="sub">Draw a shape on the map, then fetch restaurants in that region (OpenStreetMap). No paid APIs.</p>
+
+      <div class="btn-row">
+        <button id="locBtn" title="Pan to your current location">Use My Location</button>
+        <button id="clearBtn" title="Clear shapes & results" style="background:#0f1422; color:#e7eaf0; border:1px solid rgba(255,255,255,.16)">Clear</button>
+      </div>
+
+      <label for="nameFilter">Name contains</label>
+      <input id="nameFilter" placeholder="e.g., pizza, cafe, taco" />
+
+      <label for="cuisineFilter">Cuisine (OSM tag)</label>
+      <input id="cuisineFilter" placeholder="e.g., mexican, italian, coffee_shop" />
+
+      <div class="btn-row">
+        <button id="searchBtn">Search in Shape</button>
+        <button id="exportBtn" title="Export results as GeoJSON" style="background:#0f1422; color:#e7eaf0; border:1px solid rgba(255,255,255,.16)">Export</button>
+      </div>
+
+      <div id="status">Draw a polygon with the shape tool on the map.</div>
+      <div id="results"></div>
+
+      <p class="help">
+        Data: OpenStreetMap via Overpass. Be kind to the service: zoom in, draw reasonable areas. This prototype caches results in your tab to reduce duplicate calls.
+      </p>
+    </aside>
+    <main id="map"></main>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+
+  <script>
+  // --- Map setup ---
+  const map = L.map('map').setView([29.7604, -95.3698], 12); // Houston-ish
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
+
+  const drawnItems = new L.FeatureGroup().addTo(map);
+  const markersLayer = new L.LayerGroup().addTo(map);
+
+  const drawControl = new L.Control.Draw({
+    edit: { featureGroup: drawnItems },
+    draw: { marker:false, circle:false, circlemarker:false, polyline:false, polygon:{ allowIntersection:false, showArea:true }, rectangle:{} }
+  });
+  map.addControl(drawControl);
+
+  let lastGeo = null;
+  let currentItems = [];
+  const memCache = new Map(); // in-tab cache keyed by query hash
+
+  map.on(L.Draw.Event.CREATED, e => {
+    drawnItems.clearLayers();
+    drawnItems.addLayer(e.layer);
+    lastGeo = e.layer.toGeoJSON();
+    setStatus('Shape ready. Click “Search in Shape”.');
+  });
+
+  map.on('draw:edited', e => {
+    const layers = e.layers.getLayers();
+    if (layers.length){ lastGeo = layers[0].toGeoJSON(); setStatus('Shape updated. Click “Search in Shape”.'); }
+  });
+
+  // --- UI ---
+  byId('locBtn').onclick = () => {
+    if (!navigator.geolocation) return alert('Geolocation not supported');
+    navigator.geolocation.getCurrentPosition(p => map.setView([p.coords.latitude, p.coords.longitude], 14), err => alert('Location error: ' + err.message));
+  };
+  byId('clearBtn').onclick = () => { drawnItems.clearLayers(); markersLayer.clearLayers(); lastGeo=null; currentItems=[]; byId('results').innerHTML=''; setStatus('Cleared. Draw a new shape.'); };
+  byId('searchBtn').onclick = () => { if (!lastGeo) return alert('Draw a polygon or rectangle first.'); fetchRestaurantsIn(lastGeo); };
+  byId('exportBtn').onclick = () => {
+    if (!currentItems.length) return alert('No results yet.');
+    const fc = { type:'FeatureCollection', features: currentItems.map(f => ({ type:'Feature', geometry:{ type:'Point', coordinates:[f.lon, f.lat] }, properties: f })) };
+    download('restaurants.geojson', JSON.stringify(fc, null, 2));
+  };
+
+  function byId(id){ return document.getElementById(id); }
+  function setStatus(msg){ byId('status').textContent = msg; }
+  function download(name, text){ const a=document.createElement('a'); a.href='data:text/json;charset=utf-8,'+encodeURIComponent(text); a.download=name; a.click(); }
+
+  // --- Overpass (OSM) ---
+  const OVERPASS_ENDPOINTS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter"
+  ];
+
+  function geoJSONPolygonToOverpassPoly(geo){
+    const coords = geo.geometry.type === 'Polygon' ? geo.geometry.coordinates[0] : null;
+    if (!coords) throw new Error('Unsupported geometry: ' + geo.geometry.type);
+    return coords.map(([lng, lat]) => `${lat} ${lng}`).join(' ');
+  }
+
+  function hashKey(obj){
+    return btoa(unescape(encodeURIComponent(JSON.stringify(obj)))).slice(0, 64);
+  }
+
+  async function overpassFetch(q){
+    // Try endpoints sequentially
+    for (const url of OVERPASS_ENDPOINTS){
+      try{
+        const res = await fetch(url, { method:'POST', headers:{ 'Content-Type':'application/x-www-form-urlencoded' }, body: new URLSearchParams({ data: q }) });
+        if (res.ok) return res.json();
+      }catch(e){ /* try next */ }
+    }
+    throw new Error('All Overpass endpoints failed');
+  }
+
+  async function fetchRestaurantsIn(geo){
+    // Debounce duplicate identical queries with caching
+    const nameFilter = (byId('nameFilter').value || '').toLowerCase().trim();
+    const cuisineFilter = (byId('cuisineFilter').value || '').toLowerCase().trim();
+
+    let poly; try { poly = geoJSONPolygonToOverpassPoly(geo); } catch(err){ setStatus('Shape error: ' + err.message); return; }
+
+    const q = `[out:json][timeout:25];
+      ( node["amenity"="restaurant"](poly:"${poly}");
+        way["amenity"="restaurant"](poly:"${poly}");
+        relation["amenity"="restaurant"](poly:"${poly}");
+      );
+      out center tags;`;
+
+    const key = hashKey({ poly, nameFilter, cuisineFilter });
+    if (memCache.has(key)){
+      const cached = memCache.get(key);
+      renderResults(cached.items, cached.fromCache=true);
+      return;
+    }
+
+    setStatus('Searching restaurants (OSM)…');
+    markersLayer.clearLayers();
+
+    try{
+      const data = await overpassFetch(q);
+      const features = (data.elements||[]).map(el => ({
+        id: el.id,
+        src: 'osm',
+        lat: el.lat || (el.center && el.center.lat),
+        lon: el.lon || (el.center && el.center.lon),
+        name: (el.tags && el.tags.name) || 'Unnamed restaurant',
+        address: [el.tags && el.tags['addr:housenumber'], el.tags && el.tags['addr:street']].filter(Boolean).join(' '),
+        city: el.tags && (el.tags['addr:city'] || el.tags['addr:town'] || el.tags['addr:suburb'] || ''),
+        cuisine: el.tags && el.tags.cuisine || ''
+      })).filter(f => f.lat && f.lon);
+
+      const filtered = features.filter(f => {
+        const matchName = nameFilter ? f.name.toLowerCase().includes(nameFilter) : true;
+        const matchCuisine = cuisineFilter ? (f.cuisine || '').toLowerCase().includes(cuisineFilter) : true;
+        return matchName && matchCuisine;
+      });
+
+      memCache.set(key, { items: filtered, t: Date.now() });
+      renderResults(filtered, false);
+    }catch(err){
+      console.error(err);
+      setStatus('Search failed: ' + err.message + '. Try a smaller area or zoom in.');
+    }
+  }
+
+  function renderResults(items, fromCache){
+    currentItems = items;
+    plotMarkers(items);
+    renderList(items);
+    if (items.length){
+      const group = L.featureGroup(markersLayer.getLayers());
+      map.fitBounds(group.getBounds(), { padding:[20,20] });
+    }
+    setStatus(`${items.length} place(s) found${fromCache ? ' (cached)' : ''}.`);
+  }
+
+  function plotMarkers(items){
+    markersLayer.clearLayers();
+    items.forEach(f => {
+      const m = L.marker([f.lat, f.lon]).addTo(markersLayer);
+      const lines = [ `<strong>${escapeHtml(f.name)}</strong>`, escapeHtml([f.address, f.city].filter(Boolean).join(', ')) ];
+      if (f.cuisine) lines.push(`Cuisine: ${escapeHtml(f.cuisine)}`);
+      m.bindPopup(lines.filter(Boolean).join('<br>'));
+    });
+  }
+
+  function renderList(items){
+    const box = byId('results');
+    if (!items.length){ box.innerHTML = '<p class="sub">No results.</p>'; return; }
+    box.innerHTML = items.map(f => {
+      return `<div class="item">
+        <h3>${escapeHtml(f.name)}</h3>
+        <div class="meta">${escapeHtml([f.address, f.city].filter(Boolean).join(', '))}</div>
+        <div class="meta">${f.cuisine ? 'Cuisine: ' + escapeHtml(f.cuisine) : ''}</div>
+      </div>`;
+    }).join('');
+  }
+
+  function escapeHtml(str){ return (str||'').replace(/[&<>\'\"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\'':'&#39;','"':'&quot;'}[c])); }
+  </script>
+</body>
+</html>
