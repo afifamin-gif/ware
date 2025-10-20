@@ -1,0 +1,92 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Ware • Supabase Sanity Test</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto; margin: 20px; }
+    button, input { padding: 10px 12px; margin: 6px 6px 6px 0; }
+    code { background: #f4f4f4; padding: 2px 6px; border-radius: 6px; }
+    .row{margin:10px 0}
+    pre{background:#111; color:#eee; padding:12px; border-radius:8px; overflow:auto}
+  </style>
+</head>
+<body>
+  <h1>Ware • Supabase Sanity Test</h1>
+
+  <div class="row">
+    <button id="btnSignIn">Sign in (magic link)</button>
+    <button id="btnWho">Who am I?</button>
+    <span id="who"></span>
+  </div>
+
+  <div class="row">
+    <button id="btnUpsertPlace">Upsert dummy place</button>
+    <button id="btnAddVisit">Add visit to dummy place</button>
+    <button id="btnListVisits">List my visits</button>
+  </div>
+
+  <pre id="out">Ready.</pre>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script>
+    const SUPABASE_URL = "SUPABASE_URL_HERE";
+    const SUPABASE_ANON = "SUPABASE_ANON_KEY_HERE";
+    const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON);
+
+    const out = (msg, obj) => {
+      const el = document.getElementById('out');
+      el.textContent = (typeof msg === 'string' ? msg : JSON.stringify(msg, null, 2)) +
+                       (obj ? '\n' + JSON.stringify(obj, null, 2) : '');
+    };
+
+    document.getElementById('btnSignIn').onclick = async () => {
+      const email = prompt("Email for magic link:");
+      if (!email) return;
+      const { error } = await sb.auth.signInWithOtp({
+        email,
+        options: { emailRedirectTo: location.origin + location.pathname.replace('test.html','') }
+      });
+      out(error ? ("Error: " + error.message) : "Check your email for the sign-in link!");
+    };
+
+    document.getElementById('btnWho').onclick = async () => {
+      const { data: { user }, error } = await sb.auth.getUser();
+      out(error ? error : (user ? ("Logged in as " + user.email) : "Not logged in"));
+      document.getElementById('who').textContent = user ? ("Logged in: " + user.email) : "Not logged in";
+    };
+
+    // Keep a dummy OSM-ish place
+    let lastPlaceId = null;
+    document.getElementById('btnUpsertPlace').onclick = async () => {
+      const row = {
+        source: 'osm',
+        source_id: 'node/TEST-12345', // unique by source+source_id
+        name: 'Test Tacos',
+        lat: 29.7604, lon: -95.3698,
+        address: '123 Test St', city: 'Houston', cuisine: 'mexican'
+      };
+      const { data, error } = await sb.from('places').upsert(row, { onConflict: 'source,source_id' }).select().single();
+      if (error) return out("Upsert error:", error);
+      lastPlaceId = data.id;
+      out("Upserted place:", data);
+    };
+
+    document.getElementById('btnAddVisit').onclick = async () => {
+      const { data: { user } } = await sb.auth.getUser();
+      if (!user) return out("Please sign in first.");
+      if (!lastPlaceId) return out("Upsert the dummy place first.");
+      const { error } = await sb.from('visits').insert([{ user_id: user.id, place_id: lastPlaceId, rating: 5, review: "Great!" }]);
+      out(error ? ("Visit insert error: " + error.message) : "Visit saved!");
+    };
+
+    document.getElementById('btnListVisits').onclick = async () => {
+      const { data: { user } } = await sb.auth.getUser();
+      if (!user) return out("Please sign in first.");
+      const { data, error } = await sb.from('visits').select('id, place_id, rating, review, created_at').order('created_at', { ascending: false });
+      out(error ? ("Select visits error: " + error.message) : data);
+    };
+  </script>
+</body>
+</html>
