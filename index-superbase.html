@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ware — Draw & Track Restaurants (OSM + Supabase)</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
+  <style>
+    :root{--bg:#0b0e14;--fg:#e7eaf0;--muted:#a9b1c0;--card:#111827;--brand:#7c8cff}
+    *{box-sizing:border-box}
+    body{margin:0; font-family:system-ui, -apple-system, Segoe UI, Roboto; background:var(--bg); color:var(--fg)}
+    .app{display:grid; grid-template-columns:360px 1fr; height:100vh}
+    .side{background:var(--card); border-right:1px solid rgba(255,255,255,.08); padding:16px; overflow:auto}
+    h1{font-size:20px; margin:0 0 8px}
+    .sub{color:var(--muted); font-size:12px; margin-bottom:12px}
+    label{font-size:12px; color:var(--muted); display:block; margin:10px 0 6px}
+    input, button{width:100%; padding:10px 12px; border-radius:10px; border:1px solid rgba(255,255,255,.12); background:#0f1422; color:var(--fg); font:inherit}
+    button{cursor:pointer; background:linear-gradient(135deg, var(--brand), #5c6fff); color:#0b0e14; font-weight:700; border:0}
+    .btn-secondary{background:#0f1422 !important; color:#e7eaf0 !important; border:1px solid rgba(255,255,255,.16) !important}
+    .btn-row{display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px}
+    #status{margin:10px 0; font-size:12px; color:var(--muted)}
+    #results{margin-top:12px}
+    .item{padding:10px; border:1px solid rgba(255,255,255,.08); border-radius:12px; margin-bottom:8px; background:#0f1422}
+    .item h3{margin:0 0 4px; font-size:14px}
+    .item .meta{font-size:12px; color:var(--muted)}
+    #map{height:100%;}
+    .help{font-size:12px; color:var(--muted); margin-top:8px}
+    .pill{display:inline-block; padding:2px 8px; border-radius:999px; background:rgba(124,140,255,.12); color:var(--brand); font-size:11px; font-weight:700}
+    .auth{display:flex; gap:8px; align-items:center; margin:8px 0 12px}
+    .auth small{color:var(--muted)}
+    .popup-actions{display:flex; gap:6px; margin-top:8px}
+    .popup-actions button{width:auto}
+    @media (max-width: 900px){.app{grid-template-columns:1fr; grid-template-rows:360px 1fr} .side{height:360px}}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="side">
+      <h1>Ware <span class="pill">OSM</span></h1>
+      <p class="sub">Draw a shape on the map to find restaurants. Sign in to save <em>Visited</em> or <em>Want to go</em>.</p>
+
+      <!-- Auth bar -->
+      <div class="auth">
+        <button id="signInBtn" class="btn-secondary" title="Magic link sign-in">Sign in</button>
+        <button id="signOutBtn" class="btn-secondary" title="Sign out" style="display:none">Sign out</button>
+        <small id="who">Not signed in</small>
+      </div>
+
+      <div class="btn-row">
+        <button id="locBtn">Use My Location</button>
+        <button id="clearBtn" class="btn-secondary">Clear</button>
+      </div>
+
+      <label for="nameFilter">Name contains</label>
+      <input id="nameFilter" placeholder="e.g., pizza, cafe, taco" />
+
+      <label for="cuisineFilter">Cuisine (OSM tag)</label>
+      <input id="cuisineFilter" placeholder="e.g., mexican, italian, coffee_shop" />
+
+      <div class="btn-row">
+        <button id="searchBtn">Search in Shape</button>
+        <button id="exportBtn" class="btn-secondary">Export</button>
+      </div>
+
+      <div id="status">Draw a polygon with the shape tool on the map.</div>
+      <div id="results"></div>
+
+      <p class="help">
+        Data: OpenStreetMap via Overpass. Results cached for 10 minutes in this tab. Please zoom in and keep areas reasonable.
+      </p>
+    </aside>
+    <main id="map"></main>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+  <!-- Supabase UMD build -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+
+  <script>
+  // ====== CONFIG: paste your Supabase values ======
+  const SUPABASE_URL = "YOUR_SUPABASE_URL";
+  const SUPABASE_ANON = "YOUR_SUPABASE_ANON_KEY";
+  // ================================================
+
+  // Supabase client
+  const supa = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON);
+
+  // --- Map setup ---
+  const map = L.map('map').setView([29.7604, -95.3698], 12);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
+
+  const drawnItems = new L.FeatureGroup().addTo(map);
+  const markersLayer = new L.LayerGroup().addTo(map);
+
+  const drawControl = new L.Control.Draw({
+    edit: { featureGroup: drawnItems },
+    draw: { marker:false, circle:false, circlemarker:false, polyline:false, polygon:{ allowIntersection:false, showArea:true }, rectangle:{} }
+  });
+  map.addControl(drawControl);
+
+  let lastGeo = null;
+  let currentItems = [];
+
+  // --- Local cache (in-tab) ---
+  const CACHE_TTL_MS = 10 * 60 * 1000;
+  const memCache = new Map();
+  const OVERPASS_ENDPOINTS = [
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.kumi.systems/api/interpreter'
+  ];
+
+  map.on(L.Draw.Event.CREATED, e => {
+    drawnItems.clearLayers();
+    drawnItems.addLayer(e.layer);
+    lastGeo = e.layer.toGeoJSON();
+    setStatus('Shape ready. Click “Search in Shape”.');
+  });
+
+  // --- UI Helpers ---
+  function byId(id){ return document.getElementById(id); }
+  function setStatus(msg){ byId('status').textContent = msg; }
+  function download(name, text){ const a=document.createElement('a'); a.href='data:text/json;charset=utf-8,'+encodeURIComponent(text); a.download=name; a.click(); }
+
+  byId('locBtn').onclick = () => {
+    if (!navigator.geolocation) return alert('Geolocation not supported');
+    navigator.geolocation.getCurrentPosition(p => map.setView([p.coords.latitude, p.coords.longitude], 14));
+  };
+
+  byId('clearBtn').onclick = () => { drawnItems.clearLayers(); markersLayer.clearLayers(); lastGeo=null; currentItems=[]; byId('results').innerHTML=''; setStatus('Cleared. Draw a new shape.'); };
+  byId('searchBtn').onclick = () => { if (!lastGeo) return alert('Draw a polygon first.'); fetchRestaurantsIn(lastGeo); };
+  byId('exportBtn').onclick = () => {
+    if (!currentItems.length) return alert('No results yet.');
+    const fc = { type:'FeatureCollection', features: currentItems.map(f => ({ type:'Feature', geometry:{ type:'Point', coordinates:[f.lon, f.lat] }, properties: f })) };
+    download('restaurants.geojson', JSON.stringify(fc, null, 2));
+  };
+
+  // --- Auth UI ---
+  const whoEl = byId('who');
+  const signInBtn = byId('signInBtn');
+  const signOutBtn = byId('signOutBtn');
+
+  async function refreshUser(){
+    const { data: { user } } = await supa.auth.getUser();
+    if (user){
+      byId('who').textContent = "Logged in: " + (user.email || user.id);
+      signInBtn.style.display = 'none';
+      signOutBtn.style.display = 'inline-block';
+    } else {
+      byId('who').textContent = "Not signed in";
+      signInBtn.style.display = 'inline-block';
+      signOutBtn.style.display = 'none';
+    }
+  }
+
+  signInBtn.onclick = async () => {
+    const email = prompt("Email for magic link:");
+    if (!email) return;
+    const { error } = await supa.auth.signInWithOtp({
+      email,
+      options: { emailRedirectTo: window.location.href }
+    });
+    if (error) alert(error.message);
+    else alert("Check your email for the sign-in link, then return to this page.");
+  };
+
+  signOutBtn.onclick = async () => {
+    await supa.auth.signOut();
+    await refreshUser();
+  };
+
+  refreshUser();
+
+  // --- Overpass (OSM) ---
+  function geoJSONPolygonToOverpassPoly(geo){
+    const coords = geo.geometry.type === 'Polygon' ? geo.geometry.coordinates[0] : null;
+    if (!coords) throw new Error('Unsupported geometry: ' + geo.geometry.type);
+    return coords.map(([lng, lat]) => `${lat} ${lng}`).join(' ');
+  }
+
+  function cacheKey(poly, nameFilter, cuisineFilter){
+    return btoa(unescape(encodeURIComponent(JSON.stringify({ poly, nameFilter, cuisineFilter }))));
+  }
+
+  function getCache(key){
+    const hit = memCache.get(key);
+    if (!hit) return null;
+    if (Date.now() - hit.ts > CACHE_TTL_MS){ memCache.delete(key); return null; }
+    return hit.items;
+  }
+  function setCache(key, items){ memCache.set(key, { items, ts: Date.now() }); }
+
+  async function overpassFetch(q){
+    for (const url of OVERPASS_ENDPOINTS){
+      try{
+        const res = await fetch(url, { method:'POST', headers:{ 'Content-Type':'application/x-www-form-urlencoded' }, body: new URLSearchParams({ data: q }) });
+        if (res.ok) return res.json();
+      }catch(e){ /* try next */ }
+    }
+    throw new Error('All Overpass endpoints failed');
+  }
+
+  async function fetchRestaurantsIn(geo){
+    const nameFilter = (byId('nameFilter').value || '').toLowerCase().trim();
+    const cuisineFilter = (byId('cuisineFilter').value || '').toLowerCase().trim();
+
+    let poly; try { poly = geoJSONPolygonToOverpassPoly(geo); } catch(err){ setStatus('Shape error: ' + err.message); return; }
+
+    const q = `[out:json][timeout:25];
+      ( node["amenity"="restaurant"](poly:"${poly}");
+        way["amenity"="restaurant"](poly:"${poly}");
+        relation["amenity"="restaurant"](poly:"${poly}");
+      );
+      out center tags;`;
+
+    const key = cacheKey(poly, nameFilter, cuisineFilter);
+    const cached = getCache(key);
+    if (cached){ renderResults(cached, true); return; }
+
+    setStatus('Searching restaurants…');
+    markersLayer.clearLayers();
+
+    try{
+      const data = await overpassFetch(q);
+      const features = (data.elements||[]).map(el => ({
+        id: el.id,
+        osm_type: el.type, // node|way|relation
+        lat: el.lat || (el.center && el.center.lat),
+        lon: el.lon || (el.center && el.center.lon),
+        name: (el.tags && el.tags.name) || 'Unnamed restaurant',
+        address: [el.tags && el.tags['addr:housenumber'], el.tags && el.tags['addr:street']].filter(Boolean).join(' '),
+        city: el.tags && (el.tags['addr:city'] || el.tags['addr:town'] || el.tags['addr:suburb'] || ''),
+        cuisine: el.tags && el.tags.cuisine || ''
+      })).filter(f => f.lat && f.lon);
+
+      const filtered = features.filter(f => {
+        const matchName = nameFilter ? f.name.toLowerCase().includes(nameFilter) : true;
+        const matchCuisine = cuisineFilter ? (f.cuisine || '').toLowerCase().includes(cuisineFilter) : true;
+        return matchName && matchCuisine;
+      });
+
+      setCache(key, filtered);
+      renderResults(filtered, false);
+    }catch(err){
+      console.error(err);
+      setStatus('Search failed: ' + err.message);
+    }
+  }
+
+  function renderResults(items, fromCache){
+    currentItems = items;
+    plotMarkers(items);
+    renderList(items);
+    if (items.length){
+      const group = L.featureGroup(markersLayer.getLayers());
+      map.fitBounds(group.getBounds(), { padding:[20,20] });
+    }
+    setStatus(`${items.length} place(s) found${fromCache ? ' (cached)' : ''}.`);
+  }
+
+  function makePopupHtml(f){
+    const addr = escapeHtml([f.address, f.city].filter(Boolean).join(', '));
+    const cuisine = f.cuisine ? `<div class="meta">Cuisine: ${escapeHtml(f.cuisine)}</div>` : '';
+    const key = `${f.osm_type||'node'}/${f.id}`;
+    return `<div>
+      <strong>${escapeHtml(f.name)}</strong><br>${addr}${cuisine}
+      <div class="popup-actions">
+        <button class="btn-visit" data-key="${key}">I ate here</button>
+        <button class="btn-want btn-secondary" data-key="${key}">Want to go</button>
+      </div>
+    </div>`;
+  }
+
+  function plotMarkers(items){
+    markersLayer.clearLayers();
+    items.forEach(f => {
+      const m = L.marker([f.lat, f.lon]).addTo(markersLayer);
+      m.__place = f; // attach for popup handlers
+      m.bindPopup(makePopupHtml(f));
+    });
+  }
+
+  markersLayer.on('popupopen', async (e) => {
+    const marker = e.popup._source;
+    const f = marker.__place;
+    const container = e.popup.getElement();
+    const visitBtn = container.querySelector('.btn-visit');
+    const wantBtn = container.querySelector('.btn-want');
+    if (visitBtn){
+      visitBtn.onclick = async () => {
+        try{
+          const place = await upsertPlaceFromFeature(f);
+          const user = await requireUser();
+          await insertVisit(user.id, place.id);
+          alert('Saved to your visits!');
+        }catch(err){ alert(err.message || err); }
+      };
+    }
+    if (wantBtn){
+      wantBtn.onclick = async () => {
+        try{
+          const place = await upsertPlaceFromFeature(f);
+          const user = await requireUser();
+          await insertWant(user.id, place.id);
+          alert('Added to your want-to-go list!');
+        }catch(err){ alert(err.message || err); }
+      };
+    }
+  });
+
+  function renderList(items){
+    const box = byId('results');
+    if (!items.length){ box.innerHTML = '<p class="sub">No results.</p>'; return; }
+    box.innerHTML = items.map(f => {
+      return `<div class="item">
+        <h3>${escapeHtml(f.name)}</h3>
+        <div class="meta">${escapeHtml([f.address, f.city].filter(Boolean).join(', '))}</div>
+        <div class="meta">${f.cuisine ? 'Cuisine: ' + escapeHtml(f.cuisine) : ''}</div>
+      </div>`;
+    }).join('');
+  }
+
+  // --- Supabase helpers for places/visits/wants ---
+  async function requireUser(){
+    const { data: { user } } = await supa.auth.getUser();
+    if (!user){
+      const email = prompt('Sign in first — enter your email for a magic link:');
+      if (!email) throw new Error('Sign-in canceled.');
+      const { error } = await supa.auth.signInWithOtp({ email, options: { emailRedirectTo: window.location.href } });
+      if (error) throw error;
+      throw new Error('Check your email, then come back to press the button again.');
+    }
+    return user;
+  }
+
+  async function upsertPlaceFromFeature(f){
+    const source_id = `${f.osm_type||'node'}/${f.id}`;
+    const row = {
+      source: 'osm',
+      source_id,
+      name: f.name,
+      lat: f.lat, lon: f.lon,
+      address: f.address || null,
+      city: f.city || null,
+      cuisine: f.cuisine || null
+    };
+    const { data, error } = await supa.from('places').upsert(row, { onConflict: 'source,source_id' }).select().single();
+    if (error) throw error;
+    return data;
+  }
+
+  async function insertVisit(user_id, place_id){
+    const { error } = await supa.from('visits').insert([{ user_id, place_id }]);
+    if (error) throw error;
+  }
+
+  async function insertWant(user_id, place_id){
+    const { error } = await supa.from('wants').insert([{ user_id, place_id }]);
+    if (error) throw error;
+  }
+
+  function escapeHtml(str){ return (str||'').replace(/[&<>\'\"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\'':'&#39;','"':'&quot;'}[c])); }
+  </script>
+</body>
+</html>
