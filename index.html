@@ -226,3 +226,61 @@
   </script>
 </body>
 </html>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+  const SUPABASE_URL = "https://YOUR_PROJECT_REF.supabase.co";
+  const SUPABASE_ANON_KEY = "YOUR_ANON_PUBLIC_KEY";
+  const supabase = supabasejs.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+  // 1) Auth UI (very simple)
+  async function signInWithEmail() {
+    const email = prompt("Enter your email for a magic link:");
+    if (!email) return;
+    const { error } = await supabase.auth.signInWithOtp({
+      email,
+      options: { emailRedirectTo: "https://afifamin-gif.github.io/ware/" } // must be allowed in Supabase auth settings
+    });
+    if (error) alert(error.message);
+    else alert("Check your email for the login link!");
+  }
+
+  async function getSessionUser() {
+    const { data: { user } } = await supabase.auth.getUser();
+    return user;
+  }
+
+  // 2) Place upsert (uses unique (source, source_id))
+  async function upsertPlaceFromOSM(osmId, payload) {
+    const row = {
+      source: "osm",
+      source_id: osmId, // e.g. "node/12345"
+      name: payload.name,
+      lat: payload.lat, lon: payload.lon,
+      address: payload.address || null,
+      city: payload.city || null,
+      cuisine: payload.cuisine || null
+    };
+    const { data, error } = await supabase
+      .from("places")
+      .upsert([row], { onConflict: "source,source_id" })
+      .select()
+      .single();
+    if (error) throw error;
+    return data; // place row (with id)
+  }
+
+  // 3) Record a visit for the logged-in user
+  async function addVisit(placeId, rating = null, review = null) {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) { alert("Please sign in first."); return; }
+    const { error } = await supabase.from("visits").insert([
+      { user_id: user.id, place_id: placeId, rating, review }
+    ]);
+    if (error) alert(error.message); else alert("Saved to your visits!");
+  }
+
+  // Example hook for your map popup button:
+  // on marker popup "I ate here":
+  //   const place = await upsertPlaceFromOSM(`node/${osmNodeId}`, {...});
+  //   await addVisit(place.id, 5, "Great!");
+</script>
